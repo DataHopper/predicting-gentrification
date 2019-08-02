@@ -1,0 +1,1093 @@
+---
+title: "CRISP-DM Final Project"
+author: "Tom Hopper"
+date: "April 15, 2018"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(readr)
+library(tidyverse)
+library(stringr)
+library(stats)
+library(e1071)
+library(kernlab)
+library(caret)
+library(neuralnet)
+library(ROCR)
+library(sf)
+library(scales)
+library(psych)
+library(caretEnsemble)
+library(mlbench)
+library(randomForest)
+```
+
+Data sources:
+https://s4.ad.brown.edu/Projects/Diversity/Researcher/Bridging.htm
+http://www.governing.com/gov-data/gentrification-in-cities-governing-report.html
+https://edg.epa.gov/data/PUBLIC/OP/SLD
+
+story:
+https://www.npr.org/sections/13.7/2017/08/29/546980178/what-does-it-take-to-see-gentrification-before-it-happens
+
+
+
+```{r}
+
+#Metro Areas
+CBSA <- read_csv("DataSets/CBSAbyPop2010.csv")
+
+#taking all metros larger than 500,000 people 
+CBSA <- CBSA %>%
+  subset(pop2010 > 500000)
+
+#extracting the CBSA codes for the fastest growing metros as a vector (fastest growing between 2000 and 2010)   
+CBSAcodes <- as.vector(CBSA$Id2)
+
+#reviewing the summary - of the 102 metros,  there is missing data on rental and homeownership vacancy for more than 30 metros. Instead of trying to impute these values (because they are a high proportion of the total, and will be applied to many records), I will instead construct regional vacancy rates by aggregating the vacancies from the census tract layer that will be imported later.
+summary(CBSA)
+
+#I'd also like to eliminate the raw population numbers and instead go with percent change in population, thinking that a high rate of growth in the decade prior to the training period data would put pressure on the regional housing market, which might increase gentrification pressure on urban neighborhoods. 
+CBSA <- CBSA %>% select(Id2, Geography, PercentChange9000, PercentChange0010, Perc18342000, Perc18342010)
+CBSA
+```
+
+```{r}
+#Urban Definitions
+Urban <- read_csv("DataSets/UrbanRuralCodes/UrbanCodes.csv")
+
+#There are some missing values for the total population fields, as well as the percent urban field, which I suspect is because there are a number of census tracts that have zeros for population, combined with the observations that have NAs for Total population. 
+summary(Urban)
+
+#A number of these tracts that have NA for totals have values for urban and rural (and many look to be mostly urban), and I'd like to include them, so I will replace those NA values with the sum of the rural and urban fields where that data exists.
+Urban[is.na(Urban$Total),]
+Urban$Total <- ifelse(is.na(Urban$Total)==TRUE, Urban$Urban + Urban$Rural, Urban$Total)
+Urban$PercUrban <- ifelse(is.na(Urban$PercUrban)==TRUE, Urban$Urban/Urban$Total, Urban$PercUrban)
+#Now we are down to just tracts with 0 values for totals,  which are generating 607 NA values in the PercUrban field.
+summary(Urban)
+
+#All of these fields have zeros for all the fields of interest. There are relatively few of them, however, and I will wait to handle this missing values until I've narrowed my data set to the metro areas of over 500,000 people that were selected in the above code chunk.
+summary(Urban[is.na(Urban$PercUrban),])
+
+#Because I am using this field to narrow my data set to just urban census tracts (gentrification is an urban phenomenon), I am narrowing the data set to just the tractid and the urban indicator, since I will be using this to distinguish the tracts that are eligible for gentrification.
+UrbanCodes <- Urban %>% mutate(UrbanTract = ifelse(PercUrban >= 0.80,1,0)) %>% select(tractid, UrbanTract)
+
+table(UrbanCodes$UrbanTract)
+
+#There are over 53,000 census tracts that are over 80% urban.
+```
+
+
+```{r}
+#Transit and Connectivity
+EPATransit <- read_csv("DataSets/EPASmartLoc_TransitandDestinations.csv")
+
+#Taking a look at the data set summary, there are a few fields with a lot of NAs, and a few with some funny coding of -99999 values.  There are a few fields that I'm interested in from this data set. First, is simply a binary field that signifies reasonable access to a transit stop. This is D4a, which is coded as -99999 if there is no reasonable access to transit from the centroid of that census tract. So, I'll need to recode that variable as a binary variable using an ifelse formula. The next variable I am looking for is one that captures the number of destinations that can be reached from the census tract by way of transit - field D5br. Just like D4a, the -99999 code here signifies that there is no transit access, so I will code all of those records as zero, and keep the rest of the records as is. I am also going to pull D5ar, which is the number of locations reachable by car. There are no NA values or -99999 codes on this variable, so I will simply rename it.
+summary(EPATransit)
+
+
+EPATransit <- EPATransit %>%
+  mutate(TransitAccess = ifelse(D4a == -99999, 0,1), DestinationsviaTransit = ifelse(D5br == -99999, 0, D5br)) %>%
+  rename(DestinationsviaCar = D5ar)%>%
+  select(GEOID10, TransitAccess, DestinationsviaTransit, DestinationsviaCar)
+
+#Unfortunately, the GEOID10 field, which will be used to join this data to the broader data set, is not quite in the right format for joining. It's an ID for the block group level, which is one geographic level finer than the tract level. To get the tractid, I need to take just the first 11 digits and then convert it to a number. 
+EPATransit$GEOID10 <- substr(EPATransit$GEOID10,1,11)
+EPATransit$GEOID10 <- as.numeric(EPATransit$GEOID10)
+
+#Because there are more block groups than tracts, I now have multiple records for each tract. In order to resolve this, I am going to simply take the maximum of the transit access field (if any block group has good transit access, then I will code the entire census tract as having good access), and then take the mean for the number of destinations by transit and car.
+EPATransit <- EPATransit %>% group_by(GEOID10) %>%
+  summarise(TransitAccess = max(TransitAccess),DestinationsviaTransit = mean(DestinationsviaTransit), DestinationsviaCar = mean(DestinationsviaCar))
+
+#Now we have a full data set, with no duplicates for tracts
+length(EPATransit$GEOID10); length(unique(EPATransit$GEOID10))
+summary(EPATransit)
+```
+
+
+
+```{r}
+#Now to begin pulling in the tract level census data from the decennial census. I will need three different years of data for this project. First I am pulling in the 2000 data. The 2000 data will be used as the input variables for model development and training. Which features from the year 2000 have predictive power for whether or not a census tract will experience gentrification by 2010? For this 2000 data set, I am also going to pull in some 1990 data, hypothesizing that changes in the prior decade (1990 to 2000) might have an impact on the likelihood that a census tract gentrifies in the subject decade (2000 to 2010).
+
+#pulling the 2000 data. The data comes in two parts, and I need data from each of the two files.   
+full2000 <- read_csv("LTDB data/LTDB_Std_2000_fullcount.csv", 
+    col_types = cols(TRTID10 = col_double()))
+sample2000 <- read_csv("LTDB data/ltdb_std_2000_sample.csv", 
+    col_types = cols(TRTID10 = col_double()))
+
+
+#joining the two 2000 data sets. Luckily, there are common keys in the data, allowing me to easily join the two data frames. While I'm at it, I will create some derived fields from the underlying data. Many of the data points in these files are total numbers, but since I'm comparing across census tracts, I want to normalize the data and create rates and proportions as predictor variables.   
+tracts2000 <- 
+  left_join(full2000,sample2000,c("TRTID10","state","county","tract","cbsa10")) %>%
+  mutate(PercWhite00 = NHWHT00/POP00, #percent of population that is white
+         PercBlack00 = NHBLK00/POP00, #percent of population that is black
+         PercChildren00 = A18UND00/POP00, #percent of population that is children
+         PercSenior00 = A60UP00/POP00, #percent of populationi that are seniors (over 60 yrs)
+         PercElderly00 = A75UP00/POP00, #percent of population that is elderly (75+)
+         OwnRate00 = OWN00/OHU00, #percent of households that are in homes they own
+         RentalRate00 = RENT00/OHU00, #percent of households that are renters
+         VacancyRate00 = VAC00/HU00, #vacancy rate
+         PercHS00 = HS00/AG25UP00, #percent of people over the age of 25 that have high school degrees
+         PercCollege00 = COL00/AG25UP00, #percent of people over the age of 25 that have college degrees
+         PercMarried00 = `Mar-00`/AG15UP00, # percent of population over 15 that is married
+         Unemployment00 = UNEMP00/CLF00, #unemployment rate
+         PercProfessional00 = PROF00/CLF00, #Percent of labor force in professional occupations
+         PercManufacturing00 = MANUF00/CLF00, #Percent of labor force in manufacturing occupations
+         PercSelfEmp00 = SEMP00/CLF00, #Percent of labor force that is self-employed
+         PercMultifamily00 = MULTI00/DMULTI00, #Percent of housing stock that is multifamily
+         PercFemWF00 = FLABF00/DFLABF00, # percent of women in the workforce
+         HHSize00 = POP00/HH00, #Average household size
+         PercOldHomes00 = H30OLD00/HU00SP, #proportion of homes that are older than 30 years
+         PercLongTimeRes00 = H10YRS00/OHU00SP)%>% # proportion of residents that have been in the tract for more than ten years#
+  rename(PerCapitaIncome00 = INCPC00)
+
+#identifying the fields to pull into my data set, including inputs to features I will derive based on metro, as well as the derived features created above.                           
+fieldstopull2000 <- c("TRTID10",
+                      "state",
+                      "county",
+                      "tract",
+                      "cbsa10",
+                      "POP00",
+                      "HINC00",
+                      "HINCW00",
+                      "HINCB00",
+                      "MHMVAL00",
+                      "MRENT00",
+                      "HU00",
+                      "HH00",
+                      "HU90",
+                      "HH90",
+                      "PerCapitaIncome00",
+                      "PercWhite00",
+                     "PercBlack00",
+                     "PercChildren00",
+                     "PercSenior00",
+                     "PercElderly00",
+                     "OwnRate00",
+                     "RentalRate00",
+                     "VacancyRate00",
+                     "PercHS00",
+                     "PercCollege00",
+                     "PercMarried00",
+                     "Unemployment00",
+                     "PercProfessional00",
+                     "PercManufacturing00",
+                     "PercSelfEmp00",
+                     "PercMultifamily00",
+                     "PercFemWF00",
+                     "HHSize00",
+                     "PercOldHomes00",
+                     "PercLongTimeRes00",
+                     "TransitAccess", 
+                     "DestinationsviaTransit", 
+                     "DestinationsviaCar",
+                     "PriorDecadeRentChange",
+                     "PriorDecadeMHMVALChange",
+                     "UrbanTract")  
+
+
+
+#pulling in some 1990 data to use in some derived variables that measure changes over the prior decade
+full1990 <- read_csv("LTDB data/LTDB_Std_1990_fullcount.csv", 
+    col_types = cols(TRTID10 = col_double()))
+sample1990 <- read_csv("LTDB data/ltdb_std_1990_sample.csv", 
+    col_types = cols(TRTID10 = col_double()))
+
+#joining the two 1990 data sets to one another and selecting just the items that will be used in my derived features  
+tracts1990 <- 
+  left_join(full1990,sample1990,c("TRTID10","state","county","tract","cbsa10")) %>%
+  select(TRTID10,state,county,tract,cbsa10,HH90,HU90,MRENT90, MHMVAL90)
+tracts1990
+
+#joining the 2000 tract data to the 1990 tracts, the EPASmart Locations data, and the urban indicator
+#creating the derived features that measure prior decade changes
+#selecting the desired fields
+tracts2000 <- tracts2000 %>% 
+  left_join(tracts1990, by=c("TRTID10","state","county","tract","cbsa10"))%>%
+  left_join(EPATransit, by = c("TRTID10" = "GEOID10")) %>%
+  left_join(UrbanCodes, by = c("TRTID10" = "tractid")) %>%
+  mutate(PriorDecadeMHMVALChange = ifelse((MHMVAL00-MHMVAL90)/(MHMVAL90) == Inf, NA, (MHMVAL00-MHMVAL90)/(MHMVAL90)),
+         PriorDecadeRentChange = (MRENT00-MRENT90)/(MRENT90))%>%
+  select(fieldstopull2000) 
+
+#aggregating change in housing units and households up to the metro level. The hypothesis here is that if the metro as a whole is adding more households than housing units (this figure would be less than zero), then the metro housing market will face heightened pressure. This could lead to gentrification of lower-income neighborhoods as demand for housing is increasing without a corresponding increase in supply.
+MetroProductionPace9000 <- tracts2000 %>%
+  group_by(cbsa10) %>%
+  summarise(MetroProductionPace9000 = (sum(HU00)-sum(HU90))/(sum(HH00)-sum(HH90)))
+
+#joining this metro statistic to the data set
+tracts2000 <- tracts2000 %>% left_join(MetroProductionPace9000, by = "cbsa10")
+tracts2000
+
+```
+
+```{r}
+#Repeating the same steps for the 2010 data set
+#pulling the 2010 data   
+full2010 <- read_csv("LTDB data/LTDB_Std_2010_fullcount.csv", 
+    col_types = cols(tractid = col_double()))
+sample2010 <- read_csv("LTDB data/ltdb_std_2010_sample.csv", 
+    col_types = cols(tractid = col_double()))
+
+#joining the two 2000 data sets   
+tracts2010 <- left_join(full2010,sample2010,c("tractid","state","county"))  %>%
+  mutate(PercWhite10 = nhwht10/pop10,
+         PercBlack10 = nhblk10/pop10,
+         PercChildren10 = a18und10/pop10,
+         PercSenior10 = a60up10/pop10,
+         PercElderly10 = a75up10/pop10,
+         OwnRate10 = own10/ohu10,
+         RentalRate10 = rent10/ohu10,
+         VacancyRate10 = vac10/hu10,
+         PercHS10 = hs12/ag25up12,
+         PercCollege10 = col12/ag25up12,
+         PercMarried10 = `12-Mar`/ag15up12,
+         Unemployment10 = unemp12/clf12,
+         PercProfessional10 = prof12/clf12,
+         PercManufacturing10 = manuf12/clf12,
+         PercSelfEmp10 = semp12/clf12,
+         PercMultifamily10 = multi12/dmulti12,
+         PercFemWF10 = flabf12/dflabf12,
+         HHSize10 = pop12/hh12,
+         PercOldHomes10 = h30old12/hu12,
+         PercLongTimeRes10 = h10yrs12/ohu12) %>%
+  rename(PerCapitaIncome10 = incpc12)
+
+#identifying the fields to pull into my data set                           
+fieldstopull2010 <- c("tractid",
+                      "state",
+                      "county",
+                      "cbsa10",
+                      "pop12",
+                      "pop10",
+                      "hinc12",
+                      "hincw12",
+                      "hincb12",
+                      "mhmval12",
+                      "mrent12",
+                      "HU00",
+                      "HH00",
+                      "hu10",
+                      "hh12",
+                      "PerCapitaIncome10",
+                      "PercWhite10",
+         "PercBlack10",
+         "PercChildren10",
+         "PercSenior10",
+         "PercElderly10",
+         "OwnRate10",
+         "RentalRate10",
+         "VacancyRate10",
+         "PercHS10",
+         "PercCollege10",
+         "PercMarried10",
+         "Unemployment10",
+         "PercProfessional10",
+         "PercManufacturing10",
+         "PercSelfEmp10",
+         "PercMultifamily10",
+         "PercFemWF10",
+         "HHSize10",
+         "PercOldHomes10",
+         "PercLongTimeRes10",
+          "TransitAccess", 
+         "DestinationsviaTransit", 
+         "DestinationsviaCar",
+         "PriorDecadeRentChange",
+         "PriorDecadeMHMVALChange",
+         "UrbanTract") 
+
+#joining the two 1990 data sets   
+appendtracts2000 <- tracts2000 %>%
+  select(TRTID10,state,county,cbsa10,HH00,HU00,MHMVAL00,MRENT00)
+
+#selecting just the desired fields
+tracts2010 <- tracts2010 %>% 
+  left_join(appendtracts2000, by=c("tractid" = "TRTID10","state","county"))%>%
+  left_join(EPATransit, by = c("tractid" = "GEOID10")) %>%
+    left_join(UrbanCodes, by = c("tractid" = "tractid")) %>%
+  mutate(PriorDecadeMHMVALChange = ifelse((mhmval12-MHMVAL00)/(MHMVAL00) ==  Inf, NA, (mhmval12-MHMVAL00)/(MHMVAL00)),
+         PriorDecadeRentChange = (mrent12-MRENT00)/(MRENT00))%>%
+  select(fieldstopull2010) 
+
+MetroProductionPace0010 <- tracts2010 %>%
+  subset(is.na(hu10) == FALSE & is.na(hh12) == FALSE & is.na(HU00) == FALSE & is.na(HH00) == FALSE) %>%
+  group_by(cbsa10) %>%
+  summarise(MetroProductionPace0010 = (sum(hu10)-sum(HU00))/(sum(hh12)-sum(HH00)))
+
+tracts2010 <- tracts2010 %>% left_join(MetroProductionPace0010, by = "cbsa10")
+head(tracts2010)
+
+```
+
+
+Determining the outcome variable: which tracts gentrified from 2000 to 2010?
+```{r}
+#joining the 2000 and 2010 data. Using the CPI inflation factor for housing to bring 2000 home prices to 2012 dollars (the 2010 data set uses 2012 median home values)
+combinedtracts <- left_join(tracts2000,tracts2010, by = c("TRTID10" = "tractid", "cbsa10"))%>%
+  mutate(MHMVAL00InflationAdj = MHMVAL00 * 1.31336, 
+         deltaPercCollege = PercCollege10 - PercCollege00,
+         deltaMHMVAL = mhmval12-MHMVAL00InflationAdj)
+
+
+#creating a subset for just those tracts in the metros with populations over 500,000 in 2010 (102 metros)
+metrotracts <- subset(combinedtracts, cbsa10 %in% CBSAcodes)
+metrotracts
+```
+
+MEthodology modified from Governing.com research: http://www.governing.com/gov-data/gentrification-in-cities-governing-report.html
+
+In order to be eligible to gentrify, the following conditions must be met:
+
+1. The tract had a population of at least 500 residents at the beginning and end of a decade and is urban.
+2. The tract's median household income was in the bottom 40th percentile when compared to all tracts within its metro area at the beginning of the   decade.
+3. The tract's median home value was in the bottom 40th percentile when compared to all tracts within its metro area at the beginning of the decade.
+
+Gentrification-eligible tracts were determined to have gentrified over a time period if they met the following criteria:
+1. An increase in a tract's educational attainment, as measured by the percentage of residents age 25 and over holding bachelor's degrees, was in the      top third percentile of all tracts within a metro area.(changed to top 50% for this project)
+2. A tract's median home value increased when adjusted for inflation.
+    I am using inflation factor of 1.31336 based on the CPI for housing 
+    http://www.in2013dollars.com/Housing/price-inflation/2000-to-2010?amount=100000
+3. The percentage increase in a tract's inflation-adjusted median home value was in the top third percentile of all tracts within a metro area.(changed     to top 50% for this project)
+
+
+```{r}
+#aggregating by metro area, and calculating the percentile thresholds that are used in the criteria for eligibility and gentrification outcome
+percentiles <- metrotracts %>% group_by(cbsa10) %>% 
+  summarise(HINC0040P = quantile(HINC00, probs=0.40, na.rm=TRUE),  
+            MHMVAL0040P = quantile(MHMVAL00, probs = 0.40, na.rm=TRUE),
+            HINC1240P = quantile(hinc12, probs=0.40, na.rm=TRUE),  
+            MHMVAL1240P = quantile(mhmval12, probs = 0.40, na.rm=TRUE),
+            deltaMedianHome66P = quantile(deltaMHMVAL, probs = 0.50, na.rm=TRUE), 
+            deltaBachelors66P = quantile(deltaPercCollege, probs = 0.50, na.rm=TRUE))
+
+#joining the combined 2000/2010 data with these newly formed percentile figures from the metro level.
+metrotracts <- metrotracts %>% left_join(percentiles, by = 'cbsa10')
+
+#filtering the combined set based on the gentrification eligibility criteria and creating a new data frame of the results
+eligible4gentrification2000 <- subset(metrotracts, POP00 >= 500 & pop12 >=500 & HINC00 < HINC0040P & MHMVAL00 < MHMVAL0040P & UrbanTract.x == 1)
+
+
+#running the gentrification criteria on the eligible census tracts
+eligible4gentrification2000$gentrified <- ifelse(eligible4gentrification2000$deltaPercCollege > eligible4gentrification2000$deltaBachelors66P & eligible4gentrification2000$deltaMHMVAL > 0 & eligible4gentrification2000$deltaMHMVAL > eligible4gentrification2000$deltaMedianHome66P,1,0)
+
+#We have 12,753 eligible tracts, and 2,355 experienced significant gentrification from 2000 to 2010.
+table(eligible4gentrification2000$gentrified)
+
+#extracting the gentrification indicator
+gentrifiedIDs <- eligible4gentrification2000 %>% select(TRTID10,gentrified)
+
+#creating a new data frame that includes the 2000 tract information, metro area features, and the new gentrified/did not gentrify outcome feature, for just the metros over 500,000 people.
+Gentrification20002010 <- tracts2000 %>%
+  left_join(CBSA, by = c("cbsa10" = "Id2")) %>% 
+  subset(cbsa10 %in% CBSAcodes & 
+           TRTID10 %in% eligible4gentrification2000$TRTID10) %>% 
+  left_join(gentrifiedIDs, "TRTID10")
+
+
+#running the same filtering for eligibility for the 2010 tracts, which we will use for prediction.These will be the eligible tracts for gentrification by 2020.
+eligible4gentrification2010 <- subset(metrotracts, pop12 >= 500 & 
+                                        hinc12 < HINC1240P & 
+                                        mhmval12 < MHMVAL1240P &
+                                        UrbanTract.x == 1)
+
+```
+
+Data exploration
+```{r}
+#taking a quick look at the summary, there are not too many missing values, but there are a few variables that have some NAs and some problematic coding. HINCW00 and HINCB00 represent white and black household income, and there are a number of NA values there. Additionally, the prior decade change in rent and home value fields, appear to have some miscalculated observations and/or outliers.
+summary(Gentrification20002010)
+
+#First to tackle the income by race features, starting with a correlation matrix of the income features and the outcome gentrification indicator.
+#All of the income features, unsurprisingly, are somewhat correlated with one another. None of those features, however, seems to be particularly well correlated with the outcome variable. This indicates that perhaps income at the start of the decade is not a good predictor of gentrification. Still, I would like to include one of these variables in my model, so I will choose per capita income, since it is a measure of the entire tract's income-population dynamic, rather than a breakout by household type. This also allows me to ignore the HINCW00 and HINCB00 fields, which have NA values.
+pairs.panels(Gentrification20002010 %>% select(HINC00,HINCW00,HINCB00,PerCapitaIncome00,gentrified))
+
+#Next, time to address some of the demographic variables and their correlations. Again, these metrics appear pretty significantly correlated with oner another, but not strongly correlated with the gentrification outcome. This indicates that perhaps racial or age composition at the beginning of the decade is not a strong predictor of gentrification. The highest correlation with the gentrification outcome is the percentage of children, with a higher proportion of children being somewhat weakly correlated with less likelihood of gentrification. I would like to include a measure of race in my models, since the topic of gentrification is inextricably also a topic about racial disparities and justice. I will choose the percent white for that measure, and will also include the percentage of children in my model. Household size and Percent of residents who have been in the tract for at least 10 years look to have some low correlations with the outcome variable, but I believe warrant inclusion in the model. Percent married has some surprising correlations with racial demographics, which warrant more exploration beyond the scope of this research. The variable does have some indication of correlation with gentrification outcomes, so I will keep it in the model.
+pairs.panels(Gentrification20002010 %>% select(PercWhite00,PercBlack00,PercChildren00,PercSenior00,PercElderly00,HHSize00,PercLongTimeRes00,PercMarried00,gentrified))
+
+#Now to explore the features related to the housing stock. Clearly tenure (rent v own) will have perfect correlation. I will choose the percent of households that are renters for my model. Vacancy and the percentage of housing stock that is older than 30 years both have small correlations with the outcome variable, but still warrant inclusion in the model. Percent multifamily is highly correlated with rental tenure proportions, but it adds an element of density to the conversation, and might also be capturing multifamily ownership buildings. I will keep it in for now. Change in rent over the prior decade seems to have some promise, and I'd like to include change in median home value as well, since that is an important variable to explore, even if it does not have predictive power (that would be a meaningful finding).
+pairs.panels(Gentrification20002010 %>% select(OwnRate00,RentalRate00,VacancyRate00,PercOldHomes00,PercMultifamily00,PriorDecadeRentChange,PriorDecadeMHMVALChange,gentrified))
+#Because I'd like to include change in median home value and change in median rent, I need to deal with missing values. Let's find them:
+subset(Gentrification20002010, (is.na(PriorDecadeRentChange)==TRUE | is.na(PriorDecadeMHMVALChange)==TRUE))
+#There are 59 observations with NA values. Looking at the data, it's clear that this is because there was either a zero dollar value for median home value for 1990 or 2000. I don't want to lose out on these records, especially because a fair share of them did experience gentrification. So, I will impute these values, making an assumption that the change in rents or home prices (whichever is missing) for that census tract is in line with the average of increases for other gentrification-eligible census tracts within the same metro area.
+HVALLookup <- Gentrification20002010 %>% group_by(cbsa10) %>% 
+  summarise(AvgHVALchange = mean(PriorDecadeMHMVALChange, na.rm = TRUE),
+            AvgRentChange = mean(PriorDecadeRentChange, na.rm = TRUE))
+Gentrification20002010 <- Gentrification20002010 %>% left_join(HVALLookup, by = c("cbsa10"="cbsa10"))
+Gentrification20002010$PriorDecadeMHMVALChange <- ifelse(is.na(Gentrification20002010$PriorDecadeMHMVALChange)==TRUE,
+                                                         Gentrification20002010$AvgHVALchange,
+                                                         Gentrification20002010$PriorDecadeMHMVALChange)
+Gentrification20002010$PriorDecadeRentChange <- ifelse(is.na(Gentrification20002010$PriorDecadeRentChange)==TRUE,
+                                                         Gentrification20002010$AvgRentChange,
+                                                         Gentrification20002010$PriorDecadeRentChange)
+summary(Gentrification20002010$PriorDecadeMHMVALChange)
+summary(Gentrification20002010$PriorDecadeRentChange)
+#Looking at the summary for home value change now, though, it appears there are some outliers, as well as perhaps at least one tract where home values have appeared to drop 100%, meaning the homes are now worth $0. This seems unlikely. Let's investigate:
+subset(Gentrification20002010, PriorDecadeMHMVALChange == -1)
+#Again, it's clear that these records are missing median home values for 2010. Like we did for the NA values, we will impute these the same way - taking the average for the metro area tracts (from within the gentrification-eligible tracts)
+Gentrification20002010$PriorDecadeMHMVALChange <- ifelse(Gentrification20002010$PriorDecadeMHMVALChange == -1,
+                                                         Gentrification20002010$AvgHVALchange,
+                                                         Gentrification20002010$PriorDecadeMHMVALChange)
+summary(Gentrification20002010$PriorDecadeMHMVALChange)
+#a little better, but it looks as if there might be some outliers. Let's test for observations with home value changes beyond 3 standard deviations from the mean.
+meanhchange <- mean(Gentrification20002010$PriorDecadeMHMVALChange)
+sdhchange <- sd(Gentrification20002010$PriorDecadeMHMVALChange)
+subset(Gentrification20002010, (PriorDecadeMHMVALChange < (meanhchange - (3*sdhchange)) |
+                                  PriorDecadeMHMVALChange > (meanhchange + (3*sdhchange))))
+#This returns three census tracts, all of which are in NYC. Looking at the other data for these records, the one that really stands out is the first one, where the change was 554% over the decade. The tract has a relatively low number of owners (about 9%). This increase could be the result of a few new upscale ownership developments in the tract that have created a significant bump in prices. Or, this could simply be erroneous data. It looks as if the median white household income may also have been incorrectly input as well, since it is above $200,000, which is much higher than the tract's median income of 16,990. So, I am going to impute this value, again with the average median home value change from the metro. The other two identified records seem reasonable given the expensive NYC market.
+Gentrification20002010$PriorDecadeMHMVALChange <- ifelse(Gentrification20002010$TRTID10 == 36005011900,
+                                                         Gentrification20002010$AvgHVALchange,
+                                                         Gentrification20002010$PriorDecadeMHMVALChange)
+#removing the imputation fields from my data set:
+Gentrification20002010 <- Gentrification20002010 %>% select(-AvgHVALchange,-AvgRentChange)
+
+#Education and employment. Percentage of adult population with a college degree stands out, as well as percentage with professional jobs, manufacturing and self-employed, all of which are somehwat correlated with one another. From this set of features, I will eliminate Percent with a high school degree, unemployment rate, and percent of the female population in the workforce.
+pairs.panels(Gentrification20002010 %>% select(PercHS00,PercCollege00,Unemployment00,PercProfessional00,PercManufacturing00,PercSelfEmp00,PercFemWF00,gentrified))
+
+#transit and mobility. I will be including all three features here, even though correlations between the features are somewhat high. For census tracts that don't have transit access, I don't want to lose the measure of mobility that the car destination measure provides, since that could prove to be meaningul in metros that don't have good transit infrastructure.
+pairs.panels(Gentrification20002010 %>% select(TransitAccess, DestinationsviaTransit, DestinationsviaCar,gentrified))
+
+#metro metrics - I'd like to include the percentage of young adults in the metro as a feature, thinking that high demand cities also have a relatively younger demographic, and often gentrifiers are younger professionals seeking relative affordability. I will exclude the percent population change from the prior decade, since the metro production pace variable might be a better measure of balanced growth (it measures change in households relative to change in housing units for the metro)
+pairs.panels(Gentrification20002010 %>% select(Perc18342000,MetroProductionPace9000,PercentChange9000,gentrified))
+```
+
+
+```{r}
+#Now that I've run correlations and explored the data items I want to include, time to filter the data set to just those factors I've deemed appropriate for inclusion:
+Gentrification20002010 <- Gentrification20002010 %>%
+  select(
+    gentrified,
+    PerCapitaIncome00,
+    PercWhite00,
+    PercChildren00,
+    HHSize00,
+    PercLongTimeRes00,
+    PercMarried00,
+    RentalRate00,
+    VacancyRate00,
+    PercOldHomes00,
+    PercMultifamily00,
+    PriorDecadeRentChange,
+    PriorDecadeMHMVALChange,
+    PercCollege00,
+    Unemployment00,
+    PercProfessional00,
+    PercManufacturing00,
+    PercSelfEmp00,
+    TransitAccess, 
+    DestinationsviaTransit, 
+    DestinationsviaCar,
+    Perc18342000,
+    MetroProductionPace9000
+    )
+
+colnames(Gentrification20002010) <- c(
+  "gentrified","PerCapitaIncome","PercWhite","PercChildren","HHSize","PercLongTimeRes","PercMarried","RentalRate","VacancyRate","PercOldHomes","PercMultifamily","PriorDecadeRentChange","PriorDecadeMHMVALChange","PercCollege","Unemployment","PercProfessional","PercManufacturing","PercSelfEmp","TransitAccess","DestinationsviaTransit","DestinationsviaCar","Perc1834","MetroProductionPacePriorDecade"
+)
+
+```
+A little more data exploration
+```{r}
+#plotting densities for variables with data subset by gentrified indicator
+
+#Per Capita Income
+ggplot()+
+  geom_density(data = subset(Gentrification20002010, gentrified == 0), aes(x=PerCapitaIncome), fill = "aquamarine3", alpha = 0.5)+
+  geom_density(data = subset(Gentrification20002010, gentrified == 1), aes(x=PerCapitaIncome), fill = "navy", alpha = 0.5)+
+  theme_bw()
+
+#Percent of households that are renters
+ggplot()+
+  geom_density(data = subset(Gentrification20002010, gentrified == 0), aes(x=RentalRate), fill = "aquamarine3", alpha = 0.5)+
+  geom_density(data = subset(Gentrification20002010, gentrified == 1), aes(x=RentalRate), fill = "navy", alpha = 0.5)+
+  theme_bw()
+
+#Percent of homes that are over 30 years old
+ggplot()+
+  geom_density(data = subset(Gentrification20002010, gentrified == 0), aes(x=PercOldHomes), fill = "aquamarine3", alpha = 0.5)+
+  geom_density(data = subset(Gentrification20002010, gentrified == 1), aes(x=PercOldHomes), fill = "navy", alpha = 0.5)+
+  theme_bw()
+
+#Prior decade rent change
+ggplot()+
+  geom_density(data = subset(Gentrification20002010, gentrified == 0), aes(x=PriorDecadeRentChange), fill = "aquamarine3", alpha = 0.5)+
+  geom_density(data = subset(Gentrification20002010, gentrified == 1), aes(x=PriorDecadeRentChange), fill = "navy", alpha = 0.5)+
+  theme_bw()
+
+#Transit accessibility
+ggplot()+
+  geom_density(data = subset(Gentrification20002010, gentrified == 0), aes(x=DestinationsviaTransit), fill = "aquamarine3", alpha = 0.5)+
+  geom_density(data = subset(Gentrification20002010, gentrified == 1), aes(x=DestinationsviaTransit), fill = "navy", alpha = 0.5)+
+  theme_bw()
+
+#Percent of 18-34 year olds in metro
+ggplot()+
+  geom_density(data = subset(Gentrification20002010, gentrified == 0), aes(x=Perc1834), fill = "aquamarine3", alpha = 0.5)+
+  geom_density(data = subset(Gentrification20002010, gentrified == 1), aes(x=Perc1834), fill = "navy", alpha = 0.5)+
+  theme_bw()
+#some promise here, at the margins
+
+#Metro housing pace keeping up with demand? Again, some promise here, at the margins.
+ggplot()+
+  geom_density(data = subset(Gentrification20002010, gentrified == 0), aes(x=MetroProductionPacePriorDecade), fill = "aquamarine3", alpha = 0.5)+
+  geom_density(data = subset(Gentrification20002010, gentrified == 1), aes(x=MetroProductionPacePriorDecade), fill = "navy", alpha = 0.5)+
+  theme_bw()
+```
+
+
+Partitioning the data  for training, validation, and testing my ensemble later (3 sets)
+```{r}
+#I am going to take a stratified sample of the data, reserving 25% for validation
+set.seed(1235)
+train.index <- createDataPartition(Gentrification20002010$gentrified, p=0.60, list=FALSE)
+traintracts <- Gentrification20002010[train.index,]
+validationandtesttracts <- Gentrification20002010[-train.index,]
+test.index <- createDataPartition(validationandtesttracts$gentrified, p=0.50, list=FALSE)
+validationtracts <- validationandtesttracts[test.index,]
+testtracts <- validationandtesttracts[-test.index,]
+
+#partitioning created the correct number of records in each set
+length(traintracts$gentrified);length(validationtracts$gentrified); length(testtracts$gentrified)
+
+#splits are relatively good, with 21%/22% for the training and testing sets
+table(traintracts$gentrified);table(validationtracts$gentrified);table(testtracts$gentrified)
+```
+
+Principal Component Analysis
+Since my data set is highly dimensional, I'm starting with PCA to extract important variables that capture as much of the variation in that data as possible.
+
+```{r}
+PCAresult <- traintracts %>% select(gentrified)
+PCAvars <- traintracts %>% select(-gentrified)
+
+pca1 <- prcomp(PCAvars, scale. = TRUE, center=TRUE)
+pca1$sdev
+head(pca1$rotation)
+plot(pca1,type="l")
+summary(pca1)
+dim(pca1$x)
+
+stdev <- pca1$sdev
+pr_var <- stdev^2
+pcavariances <- pr_var/sum(pr_var)
+
+
+plot(cumsum(pcavariances), xlab="Principal Component",
+ylab = "Cumulative proportion of Variance",
+type="b")
+
+#The first 20 of 22 principal components are capturing nearly 90% of the variance. This isn't great, because the data set itself is only 22 features wide. Since PCA did not meaningfully narrow my data set to just a few principal components, I am going to run my models on the original parameters, rather than principal components. Of course, this PCA outcome is an indication that my models may not perform particularly well in attributing variances in the data and the outcome variable.
+```
+
+
+LOGISTIC REGRESSION
+```{r}
+logittrain <- traintracts[complete.cases(traintracts),]
+logitvalidation <- validationtracts[complete.cases(validationtracts),]
+
+logittrain$gentrified <- as.factor(logittrain$gentrified)
+logitvalidation$gentrified <- as.factor(logitvalidation$gentrified)
+
+logitmodel <- glm(gentrified ~.,
+    data = logittrain,
+    family = "binomial")
+
+
+summary(logitmodel)
+
+```
+
+Backfitting the regression model
+```{r}
+#That output looks promising. Let's backfit the model to simplify and optimize to the impactful features
+backfitlogit <- step(logitmodel,direction = "backward")
+formula(backfitlogit)
+
+#storing the backfitted model:
+fitted.logit <- 
+glm(formula = formula(backfitlogit), 
+    family = "binomial", 
+    data = logittrain)
+
+#The backfitting process identified 15 of the 22 features to keep in the model. There are a fair number of features from the model that have a statistically significant impact on the probability that a census tract will see gentrification.
+summary(fitted.logit)
+```
+
+```{r}
+#k-fold cross validation on the backfitted model
+ctrl <- trainControl(method = "cv", number = 10, savePredictions = TRUE)
+
+fitted.logit.tuned <- train(formula(backfitlogit),
+    data = logittrain, 
+    method = "glm", 
+    family = "binomial",
+    trControl = ctrl,
+    tuneLength = 5)
+
+summary(fitted.logit.tuned)
+
+#running the test data through the model
+logitvalidationresults <- predict(fitted.logit.tuned,logitvalidation)
+logitpred <- as.vector(as.factor(logitvalidationresults))
+
+#Creating a comparison table
+confusionMatrix(logitvalidationresults,logitvalidation$gentrified)
+
+#Looking at the sensitivity and specificity metrics, it looks as if the model has done well on predicting true negatives, but not so good on true positives.
+
+#Let's calculate the AUC
+detach(package:ROCR)
+library(ROCR)
+
+logit_AUC <- performance(prediction(as.numeric(logitvalidationresults),logitvalidation$gentrified),measure = "auc")
+logitAUC <- logit_AUC@y.values
+logitAUC
+
+#AUC is not great, barely over 0.5, but better than random chance, so that's a start
+```
+
+
+```{r}
+#perhaps a support vector machine will provide a better performance on true positives.
+#creating new names for test and train for this model
+ksvmtrain <- traintracts
+ksvmvalidation <- validationtracts
+
+#For ksvm, we need to normalize features that are not between 0 and 1  
+#generating a quick min-max normalization function
+normalize <- function (x) {
+  return( (x-min(x)) / (max(x) - min(x)))
+}
+
+#normalizing all of the features:
+ksvmtrain <- as.data.frame(lapply(ksvmtrain, normalize))
+ksvmvalidation <- as.data.frame(lapply(ksvmvalidation, normalize))
+
+
+#ksvm likes a categorical, non-numeric outcome, so changing the outcome variable to yes/no
+ksvmtrain$gentrified <- ifelse(ksvmtrain$gentrified == 0, "no","yes")
+ksvmvalidation$gentrified <- ifelse(ksvmvalidation$gentrified == 0, "no","yes")
+
+#ksvm() package has built in cross-validation, which I will be taking advantage of to perform 10-fold cross-validation.
+#I attempted ksvm() models for six different kernel types, most of which were not appropriate for my data. I've determined that
+#rbfdot and tanh dot are the only kernels that provide a reasonably good fit for my data
+
+#using rbfdot kernel
+gentclassifier_rbf <- ksvm(gentrified ~ ., data = ksvmtrain, kernel = "rbfdot", cross = 10)
+ksvmpred_rbf <- predict(gentclassifier_rbf,ksvmvalidation)
+confusionMatrix(ksvmpred_rbf,ksvmvalidation$gentrified)
+#rbfdot achieved an 81.5% accuracy rate, but did poorly predicting true positives (gentrification). Specificity was only 0.27
+
+
+#using tanhdot kernel
+gentclassifier_tanh <- ksvm(gentrified ~ ., data = ksvmtrain, kernel = "tanhdot", cross = 10)
+ksvmpred_tanh <- predict(gentclassifier_tanh,ksvmvalidation)
+confusionMatrix(ksvmpred_tanh,ksvmvalidation$gentrified)
+#tanhdot achieved lower accuracy overall, and was much worse predicting true positives (specificity of 0.04).
+
+#Comparing AUC for the two ksvm models:
+detach(package:ROCR)
+library(ROCR)
+#rbf
+ksvmAUC_rbf <- ifelse(ksvmpred_rbf == "yes", 1, 0)
+KSVM_PERF_rbf <- performance(prediction(ksvmAUC_rbf,validationtracts$gentrified),measure = "auc")
+ksvmAUC_rbf <-KSVM_PERF_rbf@y.values
+#tanh
+ksvmAUC_tanh <- ifelse(ksvmpred_tanh == "yes", 1, 0)
+KSVM_PERF_tanh <- performance(prediction(ksvmAUC_tanh,validationtracts$gentrified),measure = "auc")
+ksvmAUC_tanh <-KSVM_PERF_tanh@y.values
+
+ksvmAUC_rbf;ksvmAUC_tanh
+
+#Overall, rbf (radial basis kernel) performed slightly better on AUC. Like the logit model, though, both barely performed better than 0.50. So far, not very promising results. I will take the radial basis kernel over the tanhdot model when creating my ensemble learner.
+
+```
+
+NEURAL NETWORK
+```{r}
+#creating new names for the train and test sets for a neural network model
+neuraltrain <- traintracts
+neuralvalidation <- validationtracts
+
+#like we did for the SVM model, we need to normalize the data
+neuraltrain <- as.data.frame(lapply(neuraltrain, normalize))
+neuralvalidation <- as.data.frame(lapply(neuralvalidation,normalize))
+colnames(neuraltrain) <- colnames(traintracts)
+colnames(neuralvalidation) <- colnames(validationtracts)
+
+
+set.seed(1234)
+gentneural <- neuralnet(gentrified ~ 
+    PerCapitaIncome + 
+    PercWhite+
+    PercChildren+
+    HHSize+
+    PercLongTimeRes+
+    PercMarried+
+    RentalRate+ 
+    VacancyRate+ 
+    PercOldHomes+
+    PercMultifamily+
+    PriorDecadeRentChange+
+    PriorDecadeMHMVALChange+
+    PercCollege+
+    Unemployment+
+    PercProfessional+
+    PercManufacturing+
+    PercSelfEmp+
+    TransitAccess+
+    DestinationsviaTransit+
+    DestinationsviaCar+
+    Perc1834+
+    MetroProductionPacePriorDecade,
+  data = neuraltrain,
+hidden = 5,
+stepmax = 1e6,
+act.fct = "logistic")
+
+#visualizing the neural network
+plot(gentneural)
+
+#running the validation data through the model and creating a vector of the net results   
+neuralresults <- compute(gentneural, neuralvalidation[,2:ncol(neuralvalidation)])
+
+summary(neuralresults)
+neuralpred <- neuralresults$net.result
+neuralpred <- round(neuralpred)
+table(neuralpred)
+
+confusionMatrix(neuralpred,neuralvalidation[,1])
+#The neural network is achieving an overall accuracy of only 63%. Here we are getting more true positives, but also more false positives, driving down accuracy.
+
+#calculating AUC for the neural network
+detach(package:ROCR)
+library(ROCR)
+
+neural_AUC <- performance(prediction(neuralpred,validationtracts$gentrified),measure = "auc")
+neuralAUC <-neural_AUC@y.values
+neuralAUC
+#The AUC is still not much higher than 0.5
+```
+
+
+Random Forest
+```{r}
+rf_fit <- randomForest(gentrified ~., data = traintracts, ntree=500)
+rf_pref <- predict(rf_fit,newdata = validationtracts)
+summary(rf_pref)
+rf_pred <- round(rf_pref)
+
+confusionMatrix(rf_pred,validationtracts$gentrified)
+#This model performance is pretty similar to the other models. 82% accuracy with high sensitivity and low specificity. Specificity is a little higher than some prior models, though.
+
+detach(package:ROCR)
+library(ROCR)
+
+#random forest   
+rf_AUC <- performance(prediction(rf_pred,validationtracts$gentrified),measure = "auc")
+rfAUC <- rf_AUC@y.values
+rfAUC
+#The AUC calculation here is a little better at 0.58, but that's still not fantastic.
+```
+
+
+Evaluating the models against one another
+```{r}
+AUCresults <- data.frame(
+model = c('logitAUC', 'ksvmAUC_rbf', 'neuralAUC', 'rfAUC')
+)
+
+AUCresults$AUC = unlist(c(logitAUC, ksvmAUC_rbf, neuralAUC, rfAUC))
+AUCresults %>% arrange(desc(AUC))
+#While none of the AUC measurements are particularly good, most of them are above 0.5, which is a start. For my ensemble learner, I will not be using the three worst-performing ksvm models (the models using anove, bessel, and spline kernels). 
+#I will weight these models based on their AUC performance, with the neural network receiving the highest weight, followed by random forest, logit, and the two remaining ksvm models.
+```
+
+Perhaps an ensemble model can achieve better results. However, an ensemble usually helps good models become even better. None of my models have performed particularly well, so I am not expecting much of an improvement by using an ensemble
+```{r}
+#starting with a voting ensemble. Since none of my models were particularly strong, I will not weight the models in the voting.
+
+#creating a data frame of all of the model predictions, then adding a simple average of the outcomes, rounded to 0 or 1
+ksvmpred_rbf <- ifelse(ksvmpred_rbf == "no", 0, 1)
+ensemble <- data.frame(
+  gentrification = as.numeric(as.character(validationtracts$gentrified)),
+  logit = as.numeric(as.character(logitpred)),
+  ksvm = as.numeric(as.character(ksvmpred_rbf)),
+  neuralnet = as.numeric(as.character(neuralpred)),
+  randomforest = as.numeric(as.character(rf_pred))
+  )
+
+#constructing a vote field that takes the average vote. Basically, if at least two models voted "yes," then the ensemble will predict gentrification for that record
+ensemble$ensemblevote <- ifelse((ensemble$logit+ensemble$ksvm+ensemble$neuralnet+ensemble$randomforest)/4 >= 0.5,1,0)
+
+#The result is pretty similar to underlying models in terms of overall accuracy, with perhaps a slight boost to specificity 
+confusionMatrix(ensemble$ensemblevote,ensemble$gentrification)
+
+#AUC is actually a little bit higher than the underlying models, at 0.60
+detach(package:ROCR)
+library(ROCR)
+ensembleAUC <- performance(prediction(ensemble$ensemblevote,ensemble$gentrification),measure = "auc")
+ensembleAUC <- ensembleAUC@y.values
+ensembleAUC
+```
+
+
+```{r}
+#creating a glm model to test the ensemble against
+ensemble$gentrification <- as.factor(ensemble$gentrification)
+ensemblestack <- glm(gentrification ~ logit + ksvm + neuralnet + randomforest,
+    data = ensemble,
+    family = "binomial")
+
+#creating the test data set by running the partitioned test data through all the underlying models and creating a test data frame from the predictions.
+logittestresults <- predict(fitted.logit.tuned,testtracts)
+logittestpred <- as.vector(as.factor(logittestresults))
+
+ksvmtest <- as.data.frame(lapply(testtracts, normalize))
+ksvmtest$gentrified <- ifelse(ksvmtest$gentrified == 0, "no","yes")
+ksvmtest_rbf <- predict(gentclassifier_rbf,ksvmtest)
+
+
+neuraltest <- testtracts
+neuraltest <- as.data.frame(lapply(neuraltest,normalize))
+neuraltestresults <- compute(gentneural, neuraltest[,2:ncol(neuraltest)])
+neuraltestpred <- neuraltestresults$net.result
+neuraltestpred <- round(neuraltestpred)
+neuraltestpred[neuraltestpred==-1] <- 0
+
+rf_testpred <- predict(rf_fit,newdata = testtracts)
+rf_testpred <- round(rf_testpred)
+
+ksvmtest_rbf <- ifelse(ksvmtest_rbf == "no", 0, 1)
+testensemble <- data.frame(
+  gentrification = testtracts$gentrified,
+  logit = as.numeric(as.character(logittestpred)),
+  ksvm = as.numeric(as.character(ksvmtest_rbf)),
+  neuralnet = as.numeric(as.character(neuraltestpred)),
+  randomforest = as.numeric(as.character(rf_testpred))
+  )
+testensemble$gentrification <- as.factor(testensemble$gentrification)
+summary(testensemble)
+
+stackpred <- predict.glm(ensemblestack,newdata = testensemble, type = "response")
+stackpred <- round(stackpred)
+table(stackpred)
+confusionMatrix(stackpred,testtracts$gentrified)
+
+detach(package:ROCR)
+library(ROCR)
+stackAUC <- performance(prediction(stackpred,testensemble$gentrification),measure = "auc")
+stackAUC <- stackAUC@y.values
+stackAUC
+
+#As it turns out, we were better off with the voting ensemble. This stacked ensemble with a glm second level reduced the AUC to about 0.54
+```
+
+
+Even though the models turned out not to be terribly predictive or accurate, I'd still like to go ahead and deploy my models on my 2010 data set, predicting which census tracts will have seen gentrification by 2020
+
+```{r}
+#creating a new data frame that includes the 2010 tract information, metro area features
+Gentrification1020 <- tracts2010 %>%
+  left_join(CBSA, by = c("cbsa10" = "Id2")) %>% 
+  subset(cbsa10 %in% CBSAcodes & 
+           tractid %in% eligible4gentrification2010$TRTID10)
+
+#performing the necessary imputations and transformations
+Gentrification1020 <- Gentrification1020 %>%
+  select(tractid,cbsa10,
+    PerCapitaIncome10,
+    PercWhite10,
+    PercChildren10,
+    HHSize10,
+    PercLongTimeRes10,
+    PercMarried10,
+    RentalRate10,
+    VacancyRate10,
+    PercOldHomes10,
+    PercMultifamily10,
+    PriorDecadeRentChange,
+    PriorDecadeMHMVALChange,
+    PercCollege10,
+    Unemployment10,
+    PercProfessional10,
+    PercManufacturing10,
+    PercSelfEmp10,
+    TransitAccess, 
+    DestinationsviaTransit, 
+    DestinationsviaCar,
+    Perc18342010,
+    MetroProductionPace0010
+    )
+
+Gentrification1020$HHSize10 <- ifelse(Gentrification1020$HHSize10 %in% c(-Inf, Inf),NA,Gentrification1020$HHSize10)
+Gentrification1020$PriorDecadeRentChange <- ifelse(Gentrification1020$PriorDecadeRentChange %in% c(-Inf, Inf,NaN),NA,Gentrification1020$PriorDecadeRentChange)
+Gentrification1020$PriorDecadeMHMVALChange <- ifelse(Gentrification1020$PriorDecadeMHMVALChange %in% c(-Inf, Inf),NA,Gentrification1020$PriorDecadeMHMVALChange)
+
+Lookup2010 <- Gentrification1020 %>% group_by(cbsa10) %>% 
+  summarise(AvgCol = mean(PercCollege10, na.rm = TRUE),
+            AvgOldHomes = mean(PercOldHomes10, na.rm=TRUE),
+            AvgRental = mean(RentalRate10, na.rm=TRUE),
+            AvgLongRes = mean(PercLongTimeRes10,na.rm = TRUE),
+            AvgUnemp = mean(Unemployment10, na.rm = TRUE),
+            AvgProf = mean(PercProfessional10, na.rm = TRUE),
+            AvgManuf = mean(PercManufacturing10, na.rm = TRUE),
+            AvgSelf = mean(PercSelfEmp10, na.rm = TRUE),
+            AvgMF = mean(PercMultifamily10, na.rm = TRUE),
+            AvgHHSize = mean(HHSize10, na.rm = TRUE),
+            AvgHVALchange = mean(PriorDecadeMHMVALChange, na.rm = TRUE),
+            AvgRentChange = mean(PriorDecadeRentChange, na.rm = TRUE))
+
+Gentrification1020 <- Gentrification1020 %>% left_join(Lookup2010, by = c("cbsa10"="cbsa10"))
+
+
+
+Gentrification1020$PriorDecadeMHMVALChange <- ifelse(is.na(Gentrification1020$PriorDecadeMHMVALChange)==TRUE,
+                                                         Gentrification1020$AvgHVALchange,
+                                                         Gentrification1020$PriorDecadeMHMVALChange)
+
+Gentrification1020$PercCollege10 <- ifelse(is.na(Gentrification1020$PercCollege10)==TRUE,
+                                                         Gentrification1020$AvgCol,
+                                                         Gentrification1020$PercCollege10)
+
+Gentrification1020$Unemployment10 <- ifelse(is.na(Gentrification1020$Unemployment10)==TRUE,
+                                                         Gentrification1020$AvgUnemp,
+                                                         Gentrification1020$Unemployment10)
+
+Gentrification1020$PercProfessional10 <- ifelse(is.na(Gentrification1020$PercProfessional10)==TRUE,
+                                                         Gentrification1020$AvgProf,
+                                                         Gentrification1020$PercProfessional10)
+
+Gentrification1020$PercManufacturing10 <- ifelse(is.na(Gentrification1020$PercManufacturing10)==TRUE,
+                                                         Gentrification1020$AvgManuf,
+                                                         Gentrification1020$PercManufacturing10)
+
+Gentrification1020$PercSelfEmp10 <- ifelse(is.na(Gentrification1020$PercSelfEmp10)==TRUE,
+                                                         Gentrification1020$AvgSelf,
+                                                         Gentrification1020$PercSelfEmp10)
+
+Gentrification1020$PriorDecadeRentChange <- ifelse(is.na(Gentrification1020$PriorDecadeRentChange)==TRUE,
+                                                         Gentrification1020$AvgRentChange,
+                                                         Gentrification1020$PriorDecadeRentChange)
+
+Gentrification1020$PercMultifamily10 <- ifelse(is.na(Gentrification1020$PercMultifamily10)==TRUE,
+                                                         Gentrification1020$AvgMF,
+                                                         Gentrification1020$PercMultifamily10)
+
+Gentrification1020$HHSize10 <- ifelse(is.na(Gentrification1020$HHSize10)==TRUE,
+                                                         Gentrification1020$AvgHHSize,
+                                                         Gentrification1020$HHSize10)
+
+Gentrification1020$RentalRate10 <- ifelse(is.na(Gentrification1020$RentalRate10)==TRUE,
+                                                         Gentrification1020$AvgRental,
+                                                         Gentrification1020$RentalRate10)
+
+Gentrification1020$PercOldHomes10 <- ifelse(is.na(Gentrification1020$PercOldHomes10)==TRUE,
+                                                         Gentrification1020$AvgOldHomes,
+                                                         Gentrification1020$PercOldHomes10)
+
+Gentrification1020$PercLongTimeRes10 <- ifelse(is.na(Gentrification1020$PercLongTimeRes10)==TRUE,
+                                                         Gentrification1020$AvgLongRes,
+                                                         Gentrification1020$PercLongTimeRes10)
+
+
+summary(Gentrification1020)
+
+#There are definitely some outliers in some of the fields
+isnt_out_z <- function(x, thres = 3, na.rm = TRUE) {
+  abs(x - mean(x, na.rm = na.rm)) <= thres * sd(x, na.rm = na.rm)
+}
+
+Gentrification1020 %>% subset(HHSize10 < (mean(HHSize10)-(3*sd(HHSize10))) |
+                               HHSize10 > (mean(HHSize10)+(3*sd(HHSize10))) )
+
+Gentrification1020$HHSize10 <- ifelse(Gentrification1020$HHSize10 < (mean(Gentrification1020$HHSize10)-(3*sd(Gentrification1020$HHSize10))) |
+                               Gentrification1020$HHSize10 > (mean(Gentrification1020$HHSize10)+(3*sd(Gentrification1020$HHSize10))),
+                                                         Gentrification1020$AvgHHSize,
+                                                         Gentrification1020$HHSize10)
+#Now that the really big numbers are gone, there are others that are popping up as outliers:
+Gentrification1020 %>% subset(HHSize10 < (mean(HHSize10)-(3*sd(HHSize10))) |
+                               HHSize10 > (mean(HHSize10)+(3*sd(HHSize10))) )
+
+Gentrification1020$HHSize10 <- ifelse(Gentrification1020$HHSize10 < (mean(Gentrification1020$HHSize10)-(3*sd(Gentrification1020$HHSize10))) |
+                               Gentrification1020$HHSize10 > (mean(Gentrification1020$HHSize10)+(3*sd(Gentrification1020$HHSize10))),
+                                                         Gentrification1020$AvgHHSize,
+                                                         Gentrification1020$HHSize10)
+
+#Rents can't change by more than 100%, or they'd be free. So, replacing all values beyond -100% to the average for the metro
+Gentrification1020 %>% subset(PriorDecadeRentChange < (mean(PriorDecadeRentChange)-(3*sd(PriorDecadeRentChange))) |
+                               PriorDecadeRentChange > (mean(PriorDecadeRentChange)+(3*sd(PriorDecadeRentChange))) )
+
+Gentrification1020$PriorDecadeRentChange <- ifelse(Gentrification1020$PriorDecadeRentChange < -100,
+                                                         Gentrification1020$AvgRentChange,
+                                                         Gentrification1020$PriorDecadeRentChange)
+
+
+Gentrification1020 %>% subset(MetroProductionPace0010 < (mean(MetroProductionPace0010)-(3*sd(MetroProductionPace0010))) |
+                               MetroProductionPace0010 > (mean(MetroProductionPace0010)+(3*sd(MetroProductionPace0010))) )
+
+
+
+#removing the imputation columns
+Gentrification1020 <- Gentrification1020 %>% select(tractid:MetroProductionPace0010)
+colnames(Gentrification1020) <- c(
+  "tractid","cbsa10","PerCapitaIncome","PercWhite","PercChildren","HHSize","PercLongTimeRes","PercMarried","RentalRate","VacancyRate","PercOldHomes","PercMultifamily","PriorDecadeRentChange","PriorDecadeMHMVALChange","PercCollege","Unemployment","PercProfessional","PercManufacturing","PercSelfEmp","TransitAccess","DestinationsviaTransit","DestinationsviaCar","Perc1834","MetroProductionPacePriorDecade"
+)
+head(Gentrification1020)  
+```
+
+```{r}
+#Running the 2010 data through the models
+data2010 <- Gentrification1020[,3:ncol(Gentrification1020)]
+data2010norm <- as.data.frame(lapply(data2010, normalize))
+colnames(data2010norm) <- colnames(data2010)
+
+logit2010 <- predict(fitted.logit.tuned,data2010)
+logit2010_pred <- as.vector(as.factor(logit2010))
+
+ksvm2010_pred <- predict(gentclassifier_rbf,data2010norm)
+ksvm2010_pred <- ifelse(ksvm2010_pred == "no", 0, 1)
+
+neural2010 <- compute(gentneural, data2010norm)
+neural2010_pred <- neural2010$net.result
+neural2010_pred <- round(neural2010_pred)
+
+rf2010_pred <- predict(rf_fit,newdata = data2010)
+rf2010_pred <- round(rf2010_pred)
+
+
+#creating a data frame of all of the model predictions, then adding a simple average of the outcomes, rounded to 0 or 1
+
+ensemble2010 <- data.frame(
+  logit = as.numeric(as.character(logit2010_pred)),
+  ksvm = as.numeric(as.character(ksvm2010_pred)),
+  neuralnet = as.numeric(as.character(neural2010_pred)),
+  randomforest = as.numeric(as.character(rf2010_pred))
+  )
+
+#constructing a vote field that takes the average vote. Basically, if at least two models voted "yes," then the ensemble will predict gentrification for that record
+ensemble2010$ensemblevote <- ifelse((ensemble2010$logit+ensemble2010$ksvm+ensemble2010$neuralnet+ensemble2010$randomforest)/4 >= 0.5,1,0)
+
+```
+
+
+
+```{r}
+Gentrification1020 <- cbind(Gentrification1020,ensemble2010$ensemblevote)
+Gentrification1020 <- Gentrification1020 %>%
+  rename(GentrificationRisk = `ensemble2010$ensemblevote`)
+
+#of the over 12,000 census tracts, the model is predicting that 217 will see gentrification by 2020
+table(Gentrification1020$GentrificationRisk)
+
+#Here are the tracts:
+Gentrification1020 %>% subset(GentrificationRisk == 1)
+```
+
+
+
+
+
